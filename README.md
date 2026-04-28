@@ -15,10 +15,18 @@ It is built on top of
 The repo ships with a few pre-generated MySQL 8 binlog samples in
 `test/samples/`. The simplest one — `01-basic-crud.binlog` — was
 produced by replaying [`test/scenarios/01-basic-crud.sql`](test/scenarios/01-basic-crud.sql)
-against a throwaway MySQL 8 container:
+against a throwaway MySQL 8 container. It writes to **two** tables on
+purpose, so the quickstart also demonstrates that the converter
+emits **one Parquet file per source table**:
 
 ```sql
 -- test/scenarios/01-basic-crud.sql
+CREATE TABLE IF NOT EXISTS customers (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(64) NOT NULL,
+    email VARCHAR(128) NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS items (
     id INT PRIMARY KEY AUTO_INCREMENT,
     sku VARCHAR(64) NOT NULL,
@@ -26,17 +34,22 @@ CREATE TABLE IF NOT EXISTS items (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+INSERT INTO customers (name, email) VALUES
+    ('Alice', 'alice@example.com'),
+    ('Bob',   'bob@example.com');
+
 INSERT INTO items (sku, qty) VALUES
     ('sku-0001', 10),
     ('sku-0002', 25),
     ('sku-0003', 5);
 
 UPDATE items SET qty = 11 WHERE sku = 'sku-0001';
+UPDATE customers SET email = 'alice+new@example.com' WHERE name = 'Alice';
 DELETE FROM items WHERE sku = 'sku-0002';
 ```
 
-That's three INSERTs, one UPDATE, one DELETE — five row events in the
-binlog. End-to-end, on a host with JDK 11+ and
+That's five INSERTs, two UPDATEs, one DELETE — eight row events split
+across two tables. End-to-end, on a host with JDK 11+ and
 [`duckdb`](https://duckdb.org/) installed (`brew install duckdb` /
 `apt-get install duckdb` / single-binary download):
 
@@ -52,42 +65,54 @@ make run \
     INPUT=test/samples/01-basic-crud.binlog \
     OUTPUT=/tmp/binlog2parquet/01-basic-crud
 
-# Result: /tmp/binlog2parquet/01-basic-crud/<db>.<table>.parquet
+# Result: one Parquet file per source table — note the two files,
+# even though the input is a single binlog.
 ls /tmp/binlog2parquet/01-basic-crud/
+# -> binlogtest.customers.parquet
 # -> binlogtest.items.parquet
 
 # 3. Query the Parquet directly with DuckDB — no schema, no loader, no
 #    extra service to stand up. DuckDB reads Parquet natively, so a
 #    single CLI command is enough to inspect what the binlog captured.
+#    The glob pulls in both per-table files at once; the per-row "table"
+#    column tells you which one each row came from.
 duckdb -c "
   SELECT timestamp_string, event, \"table\", data, old, changed
   FROM read_parquet('/tmp/binlog2parquet/01-basic-crud/*.parquet')
-  ORDER BY position;
+  ORDER BY \"table\", position;
 "
 ```
 
 Expected DuckDB output (timestamps will differ; row contents will not):
 
 ```
-┌──────────────────────────┬─────────────────┬──────────────────┬─────────────────────────────────────────────────────────────────────────────────┬─────────────────────────────────────────────────────────────────────────────────┬─────────────────────────────┐
-│     timestamp_string     │      event      │      table       │                                      data                                       │                                       old                                       │           changed           │
-├──────────────────────────┼─────────────────┼──────────────────┼─────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────┤
-│ 2026-04-28 17:02:11-05   │ EXT_WRITE_ROWS  │ binlogtest.items │ {"id":1,"sku":"sku-0001","qty":10,"created_at":"2026-04-28T22:02:11.000+00:00"} │ NULL                                                                            │ NULL                        │
-│ 2026-04-28 17:02:11-05   │ EXT_WRITE_ROWS  │ binlogtest.items │ {"id":2,"sku":"sku-0002","qty":25,"created_at":"2026-04-28T22:02:11.000+00:00"} │ NULL                                                                            │ NULL                        │
-│ 2026-04-28 17:02:11-05   │ EXT_WRITE_ROWS  │ binlogtest.items │ {"id":3,"sku":"sku-0003","qty":5,"created_at":"2026-04-28T22:02:11.000+00:00"}  │ NULL                                                                            │ NULL                        │
-│ 2026-04-28 17:02:11-05   │ EXT_UPDATE_ROWS │ binlogtest.items │ {"id":1,"sku":"sku-0001","qty":11,"created_at":"2026-04-28T22:02:11.000+00:00"} │ {"id":1,"sku":"sku-0001","qty":10,"created_at":"2026-04-28T22:02:11.000+00:00"} │ {"qty":{"old":10,"new":11}} │
-│ 2026-04-28 17:02:11-05   │ EXT_DELETE_ROWS │ binlogtest.items │ {"id":2,"sku":"sku-0002","qty":25,"created_at":"2026-04-28T22:02:11.000+00:00"} │ {"id":2,"sku":"sku-0002","qty":25,"created_at":"2026-04-28T22:02:11.000+00:00"} │ NULL                        │
-└──────────────────────────┴─────────────────┴──────────────────┴─────────────────────────────────────────────────────────────────────────────────┴─────────────────────────────────────────────────────────────────────────────────┴─────────────────────────────┘
+┌──────────────────────────┬─────────────────┬──────────────────────┬─────────────────────────────────────────────────────────────────────────────────┬─────────────────────────────────────────────────────────────────────────────────┬─────────────────────────────────────────────────────────────────────┐
+│     timestamp_string     │      event      │        table         │                                      data                                       │                                       old                                       │                               changed                               │
+├──────────────────────────┼─────────────────┼──────────────────────┼─────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+│ 2026-04-28 17:14:01-05   │ EXT_WRITE_ROWS  │ binlogtest.customers │ {"id":1,"name":"Alice","email":"alice@example.com"}                             │ NULL                                                                            │ NULL                                                                │
+│ 2026-04-28 17:14:01-05   │ EXT_WRITE_ROWS  │ binlogtest.customers │ {"id":2,"name":"Bob","email":"bob@example.com"}                                 │ NULL                                                                            │ NULL                                                                │
+│ 2026-04-28 17:14:01-05   │ EXT_UPDATE_ROWS │ binlogtest.customers │ {"id":1,"name":"Alice","email":"alice+new@example.com"}                         │ {"id":1,"name":"Alice","email":"alice@example.com"}                             │ {"email":{"old":"alice@example.com","new":"alice+new@example.com"}} │
+│ 2026-04-28 17:14:01-05   │ EXT_WRITE_ROWS  │ binlogtest.items     │ {"id":1,"sku":"sku-0001","qty":10,"created_at":"2026-04-28T22:14:01.000+00:00"} │ NULL                                                                            │ NULL                                                                │
+│ 2026-04-28 17:14:01-05   │ EXT_WRITE_ROWS  │ binlogtest.items     │ {"id":2,"sku":"sku-0002","qty":25,"created_at":"2026-04-28T22:14:01.000+00:00"} │ NULL                                                                            │ NULL                                                                │
+│ 2026-04-28 17:14:01-05   │ EXT_WRITE_ROWS  │ binlogtest.items     │ {"id":3,"sku":"sku-0003","qty":5,"created_at":"2026-04-28T22:14:01.000+00:00"}  │ NULL                                                                            │ NULL                                                                │
+│ 2026-04-28 17:14:01-05   │ EXT_UPDATE_ROWS │ binlogtest.items     │ {"id":1,"sku":"sku-0001","qty":11,"created_at":"2026-04-28T22:14:01.000+00:00"} │ {"id":1,"sku":"sku-0001","qty":10,"created_at":"2026-04-28T22:14:01.000+00:00"} │ {"qty":{"old":10,"new":11}}                                         │
+│ 2026-04-28 17:14:01-05   │ EXT_DELETE_ROWS │ binlogtest.items     │ {"id":2,"sku":"sku-0002","qty":25,"created_at":"2026-04-28T22:14:01.000+00:00"} │ {"id":2,"sku":"sku-0002","qty":25,"created_at":"2026-04-28T22:14:01.000+00:00"} │ NULL                                                                │
+└──────────────────────────┴─────────────────┴──────────────────────┴─────────────────────────────────────────────────────────────────────────────────┴─────────────────────────────────────────────────────────────────────────────────┴─────────────────────────────────────────────────────────────────────┘
 ```
 
 Notice that:
 
-- The three `INSERT`s appear as `EXT_WRITE_ROWS` with `data` = the new
+- One input binlog produced **two** Parquet files —
+  `binlogtest.customers.parquet` and `binlogtest.items.parquet` —
+  because the converter shards the output by source table. The
+  `"table"` column on each row tells you which file it came from.
+- The five `INSERT`s appear as `EXT_WRITE_ROWS` with `data` = the new
   row image and `old` / `changed` = NULL.
-- The `UPDATE` appears as `EXT_UPDATE_ROWS` with `data` = post-image,
-  `old` = pre-image, and `changed` = a JSON diff
-  (`{"qty":{"old":10,"new":11}}`) — exactly what you'd want to power a
-  time-travel query.
+- The two `UPDATE`s appear as `EXT_UPDATE_ROWS` with `data` =
+  post-image, `old` = pre-image, and `changed` = a JSON diff
+  (`{"qty":{"old":10,"new":11}}` /
+  `{"email":{"old":"alice@example.com","new":"alice+new@example.com"}}`)
+  — exactly what you'd want to power a time-travel query.
 - The `DELETE` appears as `EXT_DELETE_ROWS` with `old` = the row that
   disappeared.
 
@@ -112,11 +137,19 @@ Parquet file per source table inside it:
 └── …
 ```
 
-The per-table split is deliberate — see
-[Output layout, in detail](#output-layout-in-detail). If you'd rather
-emit a single combined file, the project is designed to be modified:
-`ParquetExporter.export` is one short method, and removing the
-`groupEventsByTable(...)` call collapses everything back to one file.
+The per-table split is deliberate — it gives Parquet's column-oriented
+encoding a much better shot at compressing the output. Within a single
+table file, `data` / `old` / `changed` rows share the same column set,
+JSON key order, and value distributions, so dictionary encoding,
+run-length encoding, and Snappy all compress aggressively. Mixing
+events from many tables into one file destroys that locality: the
+column values look effectively random, dictionaries blow up, and the
+file ends up substantially larger.
+
+If you'd rather emit a single combined file anyway, the project is
+designed to be modified: `ParquetExporter.export` is one short method,
+and removing the `groupEventsByTable(...)` call collapses everything
+back to one file.
 
 If you don't have a JDK on the host, swap step 1 for the [Docker
 build](#docker-zero-host-install) — same output, no host install.
@@ -276,6 +309,130 @@ MySQL workloads — including pathological binlogs whose parsing required
 
 ---
 
+## Tradeoffs and known downsides
+
+Before adopting this tool, be aware of the following — most are direct
+consequences of the "JVM + Apache Parquet" implementation choice:
+
+- **The shaded jar is fat (~65–70 MB).** Apache Parquet's Java writer
+  pulls in `parquet-hadoop`, which transitively drags in much of the
+  Hadoop client stack (`hadoop-common`, `hadoop-auth`, Kerberos / JAAS
+  bits, `commons-*`, `guava`, `protobuf`, `woodstox`, `re2j`, …). None
+  of that is logically required to write a Parquet file, but the writer
+  is layered on top of Hadoop's `FileSystem` / `Configuration`
+  abstractions, so it ships with them. The runtime artifact is
+  correspondingly large compared to a "pure" Parquet writer in Rust /
+  C++ / Go (typically a few MB or a single static binary).
+  - The same coupling means startup cost is JVM-class — expect a
+    second or two of JVM + Hadoop initialization before the first byte
+    of the binlog is read. Fine for batch processing whole binlog files
+    (the use case this tool is built for); a poor fit for short-lived
+    invocations on tiny inputs.
+  - If shipping size is critical (e.g. embedding into another tool, or
+    distributing to many edge hosts), consider one of the lighter-weight
+    Parquet implementations — [Apache Arrow Parquet (C++)](https://arrow.apache.org/docs/cpp/parquet.html),
+    [`parquet` (Rust)](https://crates.io/crates/parquet), or
+    [`pyarrow`](https://arrow.apache.org/docs/python/parquet.html) —
+    and call this tool only for binlog parsing, or port the binlog →
+    row-image logic to that ecosystem.
+
+- **Heap requirements scale with binlog metadata, not just data.**
+  `binlog_row_metadata=FULL` (which is required for column names) embeds
+  a full copy of the table's column metadata in *every* row event. On
+  wide tables and long binlogs that means JVM heap can be many multiples
+  of the on-disk binlog size — we have seen single files require
+  >150 GB of heap to convert. There is no streaming/spill-to-disk
+  fallback in the current code path; if the heap is undersized, the
+  process OOMs and the run is lost. See
+  [Memory monitoring](#memory-monitoring) for sizing guidance.
+
+- **One file in, one directory out — no incremental / streaming mode.**
+  The tool processes a single closed binlog file end-to-end. There is no
+  tail-following mode, no resume-from-offset, no checkpointing. If a
+  conversion fails partway through, you re-run the whole file. This is
+  intentional (see [Decouple archiving from processing](#3-decouple-archiving-from-processing))
+  but it does mean that very large individual binlog files have a
+  proportionally large blast radius on a failed run.
+
+- **Values are JSON-encoded inside `data` / `old`, not typed Parquet
+  columns.** The output schema is flat and table-agnostic; per-column
+  types are not preserved as Parquet types. Downstream queries have to
+  use engine-native JSON functions (DuckDB `json_extract`, Spark
+  `from_json`, etc.) and treat numeric / binary values defensively. See
+  [Caveats](#caveats) under the schema section for the full list.
+
+- **DDL never appears in the output.** `ALTER` / `CREATE` / `DROP`
+  arrive as `QUERY` events and are dropped on the floor. If you need a
+  record of schema changes, capture them out-of-band.
+
+---
+
+## Possible extensions
+
+The tool is intentionally narrow — one binlog file in, one directory
+of Parquet out — but a few directions are obvious next steps if you
+want to fork it. None of these are implemented today; they are
+documented here as extension points, with pointers to the code you'd
+touch.
+
+- **Run as a long-lived web service rather than a one-shot CLI.** The
+  current entry point ([`Main.main`](src/main/java/io/github/binlog2parquet/Main.java))
+  parses argv and exits. Wrapping the same `BinlogReader` →
+  `ParquetExporter` pipeline in a small HTTP server (e.g.
+  Javalin / Spring Boot / `com.sun.net.httpserver.HttpServer`) would
+  let an upstream archiver `POST` a binlog path (or upload bytes) and
+  get back a manifest of the per-table Parquet files. The conversion
+  logic itself does not need to change — only the framing around it.
+  The same long-lived process could keep the JVM warm across
+  conversions, which materially reduces the second-or-two of
+  Hadoop / JVM start-up cost noted in [Tradeoffs](#tradeoffs-and-known-downsides).
+
+- **Column- or row-level encryption on the output.** Parquet has
+  native modular encryption (`PARQUET-1396`) which the underlying
+  `parquet-hadoop` writer already supports — the hook would be in
+  [`ParquetExporter.export`](src/main/java/io/github/binlog2parquet/ParquetExporter.java),
+  where the `ParquetWriter` is built. Pass an encryption properties
+  builder configured with a KMS-backed key retriever and the writer
+  will emit encrypted column chunks. A common shape is "encrypt
+  `data` / `old` / `changed` (the user-data columns) but leave `gtid`
+  / `position` / `table` clear" so downstream queries can still index
+  and filter without unwrapping the secret material.
+
+- **Up-front allow-list of tables and columns.** The tool currently
+  emits every row event for every table in the binlog, with all
+  columns inlined into the `data` / `old` JSON. Two filters would let
+  consumers cut volume (and exposure) significantly:
+    1. A **table allow-list / deny-list** applied where events are
+       grouped (`groupEventsByTable(...)` in `ParquetExporter`) — drop
+       events for unlisted tables before they ever reach a writer.
+    2. A **per-table column projection / redaction list** applied
+       where the row image is materialized into JSON
+       ([`EventWrapper`](src/main/java/io/github/binlog2parquet/EventWrapper.java),
+       which Jackson-serializes the row into the `data` / `old` /
+       `changed` strings). Unlisted columns get omitted (or replaced
+       with a hash / sentinel) so PII never lands in Parquet in the
+       first place.
+  Both are local edits — the schema and the rest of the pipeline are
+  unchanged.
+
+- **Delete the source binlog after a successful conversion.** Today
+  `Main` reads the binlog and writes Parquet; it never touches the
+  input afterward. If your archiver is durable (e.g. the binlog is
+  S3-resident under a versioned bucket and the converter has already
+  copied it to a "processed" prefix), an opt-in
+  `--delete-input-on-success` flag at the end of `Main.main` is a
+  one-liner. Worth gating on (a) the Parquet writer having closed
+  cleanly without exceptions, and (b) the output files being non-zero
+  size — both are observable from `ParquetExporter.export`'s return
+  path. For safety, keep this **off by default**; a stale archive is
+  recoverable, a deleted-and-not-converted binlog is not.
+
+These are deliberately scoped as extensions, not roadmap items — the
+core tool is meant to stay small enough to read end-to-end. If you
+implement any of them, the seams above are where to cut.
+
+---
+
 ## Requirements on the source MySQL server
 
 The Parquet output captures the full pre/post image of every row, with
@@ -328,7 +485,20 @@ The operation couldn't be completed. Unable to locate a Java Runtime.
 Please visit http://www.java.com for information on installing Java.
 ```
 
-…there is no JDK on `PATH` / `JAVA_HOME`. You have two options:
+…there is no JDK on `PATH` / `JAVA_HOME`. You have two options.
+
+> **macOS — already `brew install`ed `openjdk@21` (or `@17`/`@11`) and
+> still hitting this?** Homebrew deliberately does not link its
+> `openjdk` formula into the system Java locations, so `/usr/libexec/java_home`
+> and `./mvnw` won't find it until you point at it explicitly:
+> ```bash
+> export JAVA_HOME=/opt/homebrew/opt/openjdk@21   # or @17 / @11
+> export PATH="$JAVA_HOME/bin:$PATH"
+> ```
+> Add those to `~/.zshrc` to make it stick. (Apple Silicon paths shown;
+> Intel Macs use `/usr/local/opt/...`.) If you'd rather have
+> `/usr/libexec/java_home` pick it up system-wide, symlink it in:
+> `sudo ln -sfn /opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk /Library/Java/JavaVirtualMachines/openjdk-21.jdk`.
 
 **Option 1 — install a JDK 11+ locally.** JDK 21 (latest LTS) is the
 recommended default; 11 and 17 also work.
