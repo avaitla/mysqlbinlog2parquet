@@ -10,6 +10,128 @@ It is built on top of
 
 ---
 
+## Quickstart — convert a sample binlog and query it with DuckDB
+
+The repo ships with a few pre-generated MySQL 8 binlog samples in
+`test/samples/`. The simplest one — `01-basic-crud.binlog` — was
+produced by replaying [`test/scenarios/01-basic-crud.sql`](test/scenarios/01-basic-crud.sql)
+against a throwaway MySQL 8 container:
+
+```sql
+-- test/scenarios/01-basic-crud.sql
+CREATE TABLE IF NOT EXISTS items (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    sku VARCHAR(64) NOT NULL,
+    qty INT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO items (sku, qty) VALUES
+    ('sku-0001', 10),
+    ('sku-0002', 25),
+    ('sku-0003', 5);
+
+UPDATE items SET qty = 11 WHERE sku = 'sku-0001';
+DELETE FROM items WHERE sku = 'sku-0002';
+```
+
+That's three INSERTs, one UPDATE, one DELETE — five row events in the
+binlog. End-to-end, on a host with JDK 11+ and
+[`duckdb`](https://duckdb.org/) installed (`brew install duckdb` /
+`apt-get install duckdb` / single-binary download):
+
+```bash
+# 1. Build the shaded uber-jar.
+make build
+# (equivalent to: ./mvnw -DskipTests package)
+
+# 2. Convert a sample binlog. The OUTPUT path is the *root* of an output
+#    directory tree — the tool writes one Parquet file per source table
+#    inside it (see "Output layout" below).
+make run \
+    INPUT=test/samples/01-basic-crud.binlog \
+    OUTPUT=/tmp/binlog2parquet/01-basic-crud
+
+# Result: /tmp/binlog2parquet/01-basic-crud/<db>.<table>.parquet
+ls /tmp/binlog2parquet/01-basic-crud/
+# -> binlogtest.items.parquet
+
+# 3. Query the Parquet directly with DuckDB — no schema, no loader, no
+#    extra service to stand up. DuckDB reads Parquet natively, so a
+#    single CLI command is enough to inspect what the binlog captured.
+duckdb -c "
+  SELECT timestamp_string, event, \"table\", data, old, changed
+  FROM read_parquet('/tmp/binlog2parquet/01-basic-crud/*.parquet')
+  ORDER BY position;
+"
+```
+
+Expected DuckDB output (timestamps will differ; row contents will not):
+
+```
+┌──────────────────────────┬─────────────────┬──────────────────┬─────────────────────────────────────────────────────────────────────────────────┬─────────────────────────────────────────────────────────────────────────────────┬─────────────────────────────┐
+│     timestamp_string     │      event      │      table       │                                      data                                       │                                       old                                       │           changed           │
+├──────────────────────────┼─────────────────┼──────────────────┼─────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────┤
+│ 2026-04-28 17:02:11-05   │ EXT_WRITE_ROWS  │ binlogtest.items │ {"id":1,"sku":"sku-0001","qty":10,"created_at":"2026-04-28T22:02:11.000+00:00"} │ NULL                                                                            │ NULL                        │
+│ 2026-04-28 17:02:11-05   │ EXT_WRITE_ROWS  │ binlogtest.items │ {"id":2,"sku":"sku-0002","qty":25,"created_at":"2026-04-28T22:02:11.000+00:00"} │ NULL                                                                            │ NULL                        │
+│ 2026-04-28 17:02:11-05   │ EXT_WRITE_ROWS  │ binlogtest.items │ {"id":3,"sku":"sku-0003","qty":5,"created_at":"2026-04-28T22:02:11.000+00:00"}  │ NULL                                                                            │ NULL                        │
+│ 2026-04-28 17:02:11-05   │ EXT_UPDATE_ROWS │ binlogtest.items │ {"id":1,"sku":"sku-0001","qty":11,"created_at":"2026-04-28T22:02:11.000+00:00"} │ {"id":1,"sku":"sku-0001","qty":10,"created_at":"2026-04-28T22:02:11.000+00:00"} │ {"qty":{"old":10,"new":11}} │
+│ 2026-04-28 17:02:11-05   │ EXT_DELETE_ROWS │ binlogtest.items │ {"id":2,"sku":"sku-0002","qty":25,"created_at":"2026-04-28T22:02:11.000+00:00"} │ {"id":2,"sku":"sku-0002","qty":25,"created_at":"2026-04-28T22:02:11.000+00:00"} │ NULL                        │
+└──────────────────────────┴─────────────────┴──────────────────┴─────────────────────────────────────────────────────────────────────────────────┴─────────────────────────────────────────────────────────────────────────────────┴─────────────────────────────┘
+```
+
+Notice that:
+
+- The three `INSERT`s appear as `EXT_WRITE_ROWS` with `data` = the new
+  row image and `old` / `changed` = NULL.
+- The `UPDATE` appears as `EXT_UPDATE_ROWS` with `data` = post-image,
+  `old` = pre-image, and `changed` = a JSON diff
+  (`{"qty":{"old":10,"new":11}}`) — exactly what you'd want to power a
+  time-travel query.
+- The `DELETE` appears as `EXT_DELETE_ROWS` with `old` = the row that
+  disappeared.
+
+That's the whole pipeline: **`binlog file → make run → Parquet → DuckDB`**.
+
+### Why DuckDB?
+
+DuckDB is the lightest-weight way we know to *process* the parquet files
+this tool emits. It has no server, no daemon, no schema registry, no
+external dependencies — just a single binary that reads Parquet
+natively, executes ordinary SQL, joins across files, and pushes filters
+into the Parquet column readers. For everything in this README that
+involves "look at the converted output," DuckDB is what we use.
+
+The same Parquet files work equally well in Spark, Trino, ClickHouse,
+Snowflake (`COPY INTO`), Athena, or Polars — see
+[Output Parquet schema](#output-parquet-schema) for the column list and
+[Per-event-type semantics](#per-event-type-semantics) for what each
+event populates. Pick whichever engine your team already runs.
+
+### Output layout
+
+Whatever path you pass as `OUTPUT`, the tool treats it as a **directory
+root** (stripping a trailing `.parquet` if present) and writes one
+Parquet file per source table inside it:
+
+```
+<OUTPUT>/
+├── <db>.<tableA>.parquet
+├── <db>.<tableB>.parquet
+└── …
+```
+
+The per-table split is deliberate — see
+[Output layout, in detail](#output-layout-in-detail). If you'd rather
+emit a single combined file, the project is designed to be modified:
+`ParquetExporter.export` is one short method, and removing the
+`groupEventsByTable(...)` call collapses everything back to one file.
+
+If you don't have a JDK on the host, swap step 1 for the [Docker
+build](#docker-zero-host-install) — same output, no host install.
+
+---
+
 ## Motivation
 
 ### 1. Get the full pre- and post-image of every row, in a queryable file
@@ -518,7 +640,7 @@ docker run --rm \
     -v "$PWD/out:/output" \
     -e JAVA_OPTS="-Xmx4g" \
     binlog2parquet \
-    /input/mysql-bin-changelog.547927 /output
+    /input/01-basic-crud.binlog /output
 ```
 
 Output lands in `./out/` on the host. Tune the JVM heap by overriding
@@ -545,7 +667,7 @@ docker run --rm \
     -e JAVA_OPTS="-Xmx4g" \
     binlog2parquet \
     --digest-mysql="jdbc:mysql://127.0.0.1:3306/sys?user=root&password=rootpw&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC" \
-    /input/mysql-bin-changelog.547927 /output
+    /input/01-basic-crud.binlog /output
 
 # When done:
 docker rm -f digest-mysql
@@ -819,21 +941,23 @@ binlog samples. See [`test/`](test/):
 - `test/generate-binlogs.sh` — Docker-backed harness that boots a MySQL 8
   container with the required settings, replays every scenario, rotates
   the log between scenarios, and copies the resulting binlog files into
-  `test/samples/`.
+  `test/samples/` named after the scenario that produced them
+  (`01-basic-crud.binlog`, `02-multi-statement-txn.binlog`,
+  `03-mixed-types.binlog`). Bootstrap output from the MySQL container is
+  intentionally discarded so the exported files only contain scenario DML.
 - `test/samples/` — pre-generated binlog samples checked into the repo
-  (one representative file is included; the harness regenerates the rest).
+  (a few KB each; regenerate with `make seed-tests`).
 
 Regenerate samples:
 
 ```bash
-./test/generate-binlogs.sh
+make seed-tests   # or: ./test/generate-binlogs.sh
 ```
 
 Then process one through the tool:
 
 ```bash
-java -jar target/binlog2parquet-0.1.0-all.jar \
-    test/samples/mysql-bin.000003 /tmp/out
+make run INPUT=test/samples/02-multi-statement-txn.binlog OUTPUT=/tmp/out
 ```
 
 ---

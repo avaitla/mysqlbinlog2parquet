@@ -25,7 +25,7 @@ $(JAR):
 run: $(JAR)
 	@if [ -z "$(INPUT)" ] || [ -z "$(OUTPUT)" ]; then \
 	    echo "ERROR: INPUT and OUTPUT are required."; \
-	    echo "  make run INPUT=test/samples/mysql-bin.000002 OUTPUT=/tmp/out.parquet"; \
+	    echo "  make run INPUT=test/samples/01-basic-crud.binlog OUTPUT=/tmp/out"; \
 	    exit 2; \
 	fi
 	java $(JAVA_OPTS) -jar $(JAR) \

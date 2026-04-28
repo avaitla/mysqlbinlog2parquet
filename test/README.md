@@ -1,74 +1,97 @@
 # Quickstart: build and run against a sample binlog
 
-This directory contains a checked-in sample binlog file
-(`samples/mysql-bin-changelog.547927`) you can use to smoke-test the tool
-end-to-end in under a minute.
+This directory contains a few small, self-documenting binlog samples in
+`samples/` that you can use to smoke-test the tool end-to-end in under a
+minute. Each sample is named after the scenario that produced it (the
+SQL files in `scenarios/`), so it's obvious from the filename what's
+inside.
+
+```
+samples/
+├── 01-basic-crud.binlog              # INSERT x3, UPDATE x1, DELETE x1 on `items`
+├── 02-multi-statement-txn.binlog     # multi-row, multi-statement transaction
+└── 03-mixed-types.binlog             # exercises a wider range of MySQL column types
+```
 
 ## 1. Build the uber-jar
 
 From the repo root:
 
 ```bash
-./mvnw -DskipTests package
+make build
+# (equivalent to: ./mvnw -DskipTests package)
 ```
 
-That produces `target/binlog2parquet-0.1.0-all.jar` (the shaded
-fat-jar containing all dependencies). JDK 11+ is required.
+That produces `target/binlog2parquet-0.1.0-all.jar` — the shaded fat-jar
+containing all dependencies. JDK 11+ is required (we test against JDK
+21, the latest LTS).
 
-## 2. Run against the bundled sample
+## 2. Run against a bundled sample
 
 ```bash
-mkdir -p /tmp/binlog2parquet-out
-
-java -jar target/binlog2parquet-0.1.0-all.jar \
-    test/samples/mysql-bin-changelog.547927 \
-    /tmp/binlog2parquet-out
+make run \
+    INPUT=test/samples/01-basic-crud.binlog \
+    OUTPUT=/tmp/binlog2parquet-out
 ```
 
-Because the second argument points at an existing directory, the tool
-auto-names the output as
-`mysql-bin-changelog.<serverId>.<paddedSeq>` inside it, e.g.
-`/tmp/binlog2parquet-out/mysql-bin-changelog.1.0000547927`.
+The output path is treated as a directory root; one Parquet file per
+source table lands inside it:
+
+```
+/tmp/binlog2parquet-out/
+└── binlogtest.items.parquet
+```
 
 You should see log lines like:
 
 ```
-[MemoryMonitor] PROCESS_START - Heap: 248MB used / ...
-Server    ID: ...
-Binary   Log: mysql-bin-changelog.547927
+Server    ID: 1
+Binary   Log: 01-basic-crud.binlog
 Merged GTIDs: ...
-Exporting <N> events to: /tmp/binlog2parquet-out/...
+Exporting 5 events to: /tmp/binlog2parquet-out
 =====================================
          PROCESSING STATISTICS
 =====================================
-Total Events: ...
+Total Events: 16
 Event Types:
-  EXT_WRITE_ROWS: ...
-  EXT_UPDATE_ROWS: ...
+  TABLE_MAP: 5
+  EXT_WRITE_ROWS: 3
+  EXT_UPDATE_ROWS: 1
+  EXT_DELETE_ROWS: 1
   ...
+Table Operations:
+  binlogtest.items: writes=3, updates=1, deletes=1, total=5
 ```
 
-## 3. Verify the output
-
-A reference Parquet file produced from the same input is committed at
-`samples/mysql-bin-changelog.547927.parquet` for comparison. Quick
-sanity check with DuckDB:
+## 3. Verify the output with DuckDB
 
 ```bash
-duckdb -c "SELECT event, COUNT(*) FROM read_parquet('/tmp/binlog2parquet-out/*') GROUP BY 1 ORDER BY 2 DESC;"
+duckdb -c "
+  SELECT timestamp_string, event, \"table\", data, old, changed
+  FROM read_parquet('/tmp/binlog2parquet-out/*.parquet')
+  ORDER BY position;
+"
 ```
 
-Or with `pqrs` / `parquet-tools`:
+Five rows back: three `EXT_WRITE_ROWS` (the inserts), one
+`EXT_UPDATE_ROWS` with an `old`/`new` diff in `changed`, and one
+`EXT_DELETE_ROWS` carrying the deleted row's pre-image in `old`.
+
+A per-table-and-event-type summary:
 
 ```bash
-pqrs schema /tmp/binlog2parquet-out/mysql-bin-changelog.1.0000547927
-pqrs head   /tmp/binlog2parquet-out/mysql-bin-changelog.1.0000547927 -n 5
+duckdb -c "
+  SELECT \"table\", event, COUNT(*) AS n
+  FROM read_parquet('/tmp/binlog2parquet-out/*.parquet')
+  GROUP BY \"table\", event
+  ORDER BY n DESC;
+"
 ```
 
 ## 4. Try query fingerprinting (optional)
 
-Spin up any MySQL 8 you can reach — including the throwaway one from
-`generate-binlogs.sh` — and pass its JDBC URL:
+Spin up any MySQL 8 you can reach (a throwaway sidecar works) and pass
+its JDBC URL via `DIGEST_MYSQL`:
 
 ```bash
 docker run -d --rm --name digest-mysql \
@@ -77,10 +100,12 @@ docker run -d --rm --name digest-mysql \
     mysql:8.0
 
 # Wait a few seconds for it to come up, then:
-java -jar target/binlog2parquet-0.1.0-all.jar \
-    --digest-mysql="jdbc:mysql://127.0.0.1:13306/sys?user=root&password=rootpw&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC" \
-    test/samples/mysql-bin-changelog.547927 \
-    /tmp/binlog2parquet-out
+make run \
+    INPUT=test/samples/01-basic-crud.binlog \
+    OUTPUT=/tmp/binlog2parquet-out \
+    DIGEST_MYSQL="jdbc:mysql://127.0.0.1:13306/sys?user=root&password=rootpw&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC"
+
+docker rm -f digest-mysql
 ```
 
 Now `query_fingerprint` and `query_hash` are populated. To find newly
@@ -88,12 +113,12 @@ introduced query shapes:
 
 ```bash
 duckdb -c "
-SELECT query_hash, MIN(timestamp_string) AS first_seen, COUNT(*) AS rows_affected
-FROM read_parquet('/tmp/binlog2parquet-out/*')
-WHERE query_hash IS NOT NULL
-GROUP BY 1
-ORDER BY first_seen DESC
-LIMIT 20;
+  SELECT query_hash, MIN(timestamp_string) AS first_seen, COUNT(*) AS rows_affected
+  FROM read_parquet('/tmp/binlog2parquet-out/*.parquet')
+  WHERE query_hash IS NOT NULL
+  GROUP BY 1
+  ORDER BY first_seen DESC
+  LIMIT 20;
 "
 ```
 
@@ -107,40 +132,18 @@ If you don't want to install a JDK or Maven on the host, the
 containers. The host needs only `docker`.
 
 ```bash
-# Build inside Docker (skips ./mvnw entirely; no host JDK needed).
 docker build -t binlog2parquet .
 
-# Run, mounting the sample dir read-only and an output dir read/write.
 docker run --rm \
     -v "$PWD/test/samples:/input:ro" \
     -v "$PWD/out:/output" \
     binlog2parquet \
-    /input/mysql-bin-changelog.547927 /output
+    /input/01-basic-crud.binlog /output
 ```
 
-The Parquet file lands in `./out/` on the host.
+The Parquet file(s) land in `./out/` on the host.
 
-To also run the digest sidecar from step 4 without touching the host
-beyond Docker:
-
-```bash
-docker network create b2p-net
-
-docker run -d --rm --name digest-mysql --network b2p-net \
-    -e MYSQL_ROOT_PASSWORD=rootpw mysql:8.0
-
-docker run --rm --network b2p-net \
-    -v "$PWD/test/samples:/input:ro" \
-    -v "$PWD/out:/output" \
-    binlog2parquet \
-    --digest-mysql="jdbc:mysql://digest-mysql:3306/sys?user=root&password=rootpw&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC" \
-    /input/mysql-bin-changelog.547927 /output
-
-docker rm -f digest-mysql
-docker network rm b2p-net
-```
-
-## 6. (Optional) Generate fresh samples
+## 6. Regenerate fresh samples
 
 To regenerate `test/samples/*` from a fresh, throwaway MySQL 8 container,
 run the harness — it boots a container with all required binlog settings
@@ -150,7 +153,7 @@ run the harness — it boots a container with all required binlog settings
 the log between scenarios, and copies the resulting binlogs out:
 
 ```bash
-./test/generate-binlogs.sh
+make seed-tests   # or: ./test/generate-binlogs.sh
 ```
 
 Requirements: `docker` and a local `mysql` client.

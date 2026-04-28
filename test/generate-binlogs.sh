@@ -3,8 +3,18 @@
 # Spin up a throwaway MySQL 8 container, replay every scenario in test/scenarios/
 # against it, then copy the resulting binlog files out to test/samples/.
 #
-# Each scenario is given its own binlog file by issuing FLUSH BINARY LOGS
-# before and after it.
+# Each scenario lands in its own dedicated binlog file (FLUSH BINARY LOGS is
+# issued between scenarios). MySQL's initial bootstrap output is intentionally
+# discarded — we wait for the server to be quiet, then rotate the log a few
+# times before running the first scenario, so the exported binlogs contain
+# only scenario DML.
+#
+# The exported files are renamed to match the scenario filename so they are
+# self-documenting:
+#
+#   test/samples/01-basic-crud.binlog
+#   test/samples/02-multi-statement-txn.binlog
+#   test/samples/03-mixed-types.binlog
 #
 # Requirements:
 #   - docker
@@ -57,29 +67,44 @@ mysql_exec() {
     mysql -h 127.0.0.1 -P "$HOST_PORT" -uroot -p"$ROOT_PASSWORD" "$@"
 }
 
-# Ensure the very first scenario starts in its own binlog file.
+# Drain the bootstrap noise: MySQL's initial schema setup keeps writing for a
+# moment after the server accepts connections. Sleep briefly to let it quiesce,
+# then rotate the binlog a couple of times so the bootstrap content is left
+# behind in early, unexported files.
+sleep 3
 mysql_exec -e "FLUSH BINARY LOGS;"
+sleep 1
+mysql_exec -e "FLUSH BINARY LOGS;"
+
+# Remember which binlog is active right now — that's the one the FIRST scenario
+# will land in. Anything strictly before it is bootstrap and gets discarded.
+first_scenario_log=$(mysql_exec -BNe "SHOW MASTER STATUS;" | awk '{print $1}')
+echo "[harness] First scenario will land in: $first_scenario_log"
+
+# Map each scenario filename to a label, and remember which binlog it produced.
+declare -a labels
+declare -a logs
 
 shopt -s nullglob
 for scenario in "$SCENARIOS_DIR"/*.sql; do
-    name=$(basename "$scenario" .sql)
-    echo "[harness] Running scenario: $name"
+    label=$(basename "$scenario" .sql)
+    active=$(mysql_exec -BNe "SHOW MASTER STATUS;" | awk '{print $1}')
+    echo "[harness] Running scenario $label -> $active"
     mysql_exec "$DATABASE" < "$scenario"
-    # Roll the binlog so each scenario produces a separate file.
+    labels+=("$label")
+    logs+=("$active")
+    # Roll the binlog so the next scenario starts in a fresh file.
     mysql_exec -e "FLUSH BINARY LOGS;"
 done
 
-echo "[harness] Listing binlogs:"
-mysql_exec -e "SHOW BINARY LOGS;"
-
 echo "[harness] Copying binlog files out of the container..."
-# Skip the currently-active log; we only export rotated (completed) ones.
-docker exec "$CONTAINER" bash -c \
-    "ls /var/lib/mysql/mysql-bin.[0-9]* | head -n -1" \
-    | while read -r path; do
-        fname=$(basename "$path")
-        echo "  -> $SAMPLES_DIR/$fname"
-        docker cp "$CONTAINER:$path" "$SAMPLES_DIR/$fname"
-    done
+for i in "${!labels[@]}"; do
+    label="${labels[$i]}"
+    src="${logs[$i]}"
+    dest="$SAMPLES_DIR/${label}.binlog"
+    echo "  -> $dest"
+    docker cp "$CONTAINER:/var/lib/mysql/${src}" "$dest"
+done
 
-echo "[harness] Done."
+echo "[harness] Done. Generated samples:"
+ls -lh "$SAMPLES_DIR"
