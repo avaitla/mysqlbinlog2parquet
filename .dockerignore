@@ -1,0 +1,7 @@
+.git
+.gitignore
+target
+test/samples
+*.md
+.idea
+.vscode
