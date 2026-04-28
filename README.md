@@ -71,50 +71,79 @@ ls /tmp/binlog2parquet/01-basic-crud/
 # -> binlogtest.customers.parquet
 # -> binlogtest.items.parquet
 
-# 3. Query the Parquet directly with DuckDB — no schema, no loader, no
-#    extra service to stand up. DuckDB reads Parquet natively, so a
-#    single CLI command is enough to inspect what the binlog captured.
-#    The glob pulls in both per-table files at once; the per-row "table"
-#    column tells you which one each row came from.
+# 3. Query each per-table Parquet file directly with DuckDB. The two
+#    files are independent — the customers file holds only customer
+#    row events, the items file holds only item row events. Reading
+#    them one at a time is the clearest demonstration of the split.
 duckdb -c "
-  SELECT timestamp_string, event, \"table\", data, old, changed
-  FROM read_parquet('/tmp/binlog2parquet/01-basic-crud/*.parquet')
-  ORDER BY \"table\", position;
+  SELECT timestamp_string, event, data, old, changed
+  FROM read_parquet('/tmp/binlog2parquet/01-basic-crud/binlogtest.customers.parquet')
+  ORDER BY position;
+"
+
+duckdb -c "
+  SELECT timestamp_string, event, data, old, changed
+  FROM read_parquet('/tmp/binlog2parquet/01-basic-crud/binlogtest.items.parquet')
+  ORDER BY position;
 "
 ```
 
-Expected DuckDB output (timestamps will differ; row contents will not):
+Expected DuckDB output (timestamps will differ; row contents will not).
+
+**`binlogtest.customers.parquet`** — three rows, all customer events:
 
 ```
-┌──────────────────────────┬─────────────────┬──────────────────────┬─────────────────────────────────────────────────────────────────────────────────┬─────────────────────────────────────────────────────────────────────────────────┬─────────────────────────────────────────────────────────────────────┐
-│     timestamp_string     │      event      │        table         │                                      data                                       │                                       old                                       │                               changed                               │
-├──────────────────────────┼─────────────────┼──────────────────────┼─────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
-│ 2026-04-28 17:14:01-05   │ EXT_WRITE_ROWS  │ binlogtest.customers │ {"id":1,"name":"Alice","email":"alice@example.com"}                             │ NULL                                                                            │ NULL                                                                │
-│ 2026-04-28 17:14:01-05   │ EXT_WRITE_ROWS  │ binlogtest.customers │ {"id":2,"name":"Bob","email":"bob@example.com"}                                 │ NULL                                                                            │ NULL                                                                │
-│ 2026-04-28 17:14:01-05   │ EXT_UPDATE_ROWS │ binlogtest.customers │ {"id":1,"name":"Alice","email":"alice+new@example.com"}                         │ {"id":1,"name":"Alice","email":"alice@example.com"}                             │ {"email":{"old":"alice@example.com","new":"alice+new@example.com"}} │
-│ 2026-04-28 17:14:01-05   │ EXT_WRITE_ROWS  │ binlogtest.items     │ {"id":1,"sku":"sku-0001","qty":10,"created_at":"2026-04-28T22:14:01.000+00:00"} │ NULL                                                                            │ NULL                                                                │
-│ 2026-04-28 17:14:01-05   │ EXT_WRITE_ROWS  │ binlogtest.items     │ {"id":2,"sku":"sku-0002","qty":25,"created_at":"2026-04-28T22:14:01.000+00:00"} │ NULL                                                                            │ NULL                                                                │
-│ 2026-04-28 17:14:01-05   │ EXT_WRITE_ROWS  │ binlogtest.items     │ {"id":3,"sku":"sku-0003","qty":5,"created_at":"2026-04-28T22:14:01.000+00:00"}  │ NULL                                                                            │ NULL                                                                │
-│ 2026-04-28 17:14:01-05   │ EXT_UPDATE_ROWS │ binlogtest.items     │ {"id":1,"sku":"sku-0001","qty":11,"created_at":"2026-04-28T22:14:01.000+00:00"} │ {"id":1,"sku":"sku-0001","qty":10,"created_at":"2026-04-28T22:14:01.000+00:00"} │ {"qty":{"old":10,"new":11}}                                         │
-│ 2026-04-28 17:14:01-05   │ EXT_DELETE_ROWS │ binlogtest.items     │ {"id":2,"sku":"sku-0002","qty":25,"created_at":"2026-04-28T22:14:01.000+00:00"} │ {"id":2,"sku":"sku-0002","qty":25,"created_at":"2026-04-28T22:14:01.000+00:00"} │ NULL                                                                │
-└──────────────────────────┴─────────────────┴──────────────────────┴─────────────────────────────────────────────────────────────────────────────────┴─────────────────────────────────────────────────────────────────────────────────┴─────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────┬─────────────────┬─────────────────────────────────────────────────────────┬─────────────────────────────────────────────────────┬─────────────────────────────────────────────────────────────────────┐
+│     timestamp_string     │      event      │                          data                           │                         old                         │                               changed                               │
+├──────────────────────────┼─────────────────┼─────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+│ 2026-04-28 17:14:01-05   │ EXT_WRITE_ROWS  │ {"id":1,"name":"Alice","email":"alice@example.com"}     │ NULL                                                │ NULL                                                                │
+│ 2026-04-28 17:14:01-05   │ EXT_WRITE_ROWS  │ {"id":2,"name":"Bob","email":"bob@example.com"}         │ NULL                                                │ NULL                                                                │
+│ 2026-04-28 17:14:01-05   │ EXT_UPDATE_ROWS │ {"id":1,"name":"Alice","email":"alice+new@example.com"} │ {"id":1,"name":"Alice","email":"alice@example.com"} │ {"email":{"old":"alice@example.com","new":"alice+new@example.com"}} │
+└──────────────────────────┴─────────────────┴─────────────────────────────────────────────────────────┴─────────────────────────────────────────────────────┴─────────────────────────────────────────────────────────────────────┘
+```
+
+**`binlogtest.items.parquet`** — five rows, all item events:
+
+```
+┌──────────────────────────┬─────────────────┬─────────────────────────────────────────────────────────────────────────────────┬─────────────────────────────────────────────────────────────────────────────────┬─────────────────────────────┐
+│     timestamp_string     │      event      │                                      data                                       │                                       old                                       │           changed           │
+├──────────────────────────┼─────────────────┼─────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────┤
+│ 2026-04-28 17:14:01-05   │ EXT_WRITE_ROWS  │ {"id":1,"sku":"sku-0001","qty":10,"created_at":"2026-04-28T22:14:01.000+00:00"} │ NULL                                                                            │ NULL                        │
+│ 2026-04-28 17:14:01-05   │ EXT_WRITE_ROWS  │ {"id":2,"sku":"sku-0002","qty":25,"created_at":"2026-04-28T22:14:01.000+00:00"} │ NULL                                                                            │ NULL                        │
+│ 2026-04-28 17:14:01-05   │ EXT_WRITE_ROWS  │ {"id":3,"sku":"sku-0003","qty":5,"created_at":"2026-04-28T22:14:01.000+00:00"}  │ NULL                                                                            │ NULL                        │
+│ 2026-04-28 17:14:01-05   │ EXT_UPDATE_ROWS │ {"id":1,"sku":"sku-0001","qty":11,"created_at":"2026-04-28T22:14:01.000+00:00"} │ {"id":1,"sku":"sku-0001","qty":10,"created_at":"2026-04-28T22:14:01.000+00:00"} │ {"qty":{"old":10,"new":11}} │
+│ 2026-04-28 17:14:01-05   │ EXT_DELETE_ROWS │ {"id":2,"sku":"sku-0002","qty":25,"created_at":"2026-04-28T22:14:01.000+00:00"} │ {"id":2,"sku":"sku-0002","qty":25,"created_at":"2026-04-28T22:14:01.000+00:00"} │ NULL                        │
+└──────────────────────────┴─────────────────┴─────────────────────────────────────────────────────────────────────────────────┴─────────────────────────────────────────────────────────────────────────────────┴─────────────────────────────┘
 ```
 
 Notice that:
 
-- One input binlog produced **two** Parquet files —
-  `binlogtest.customers.parquet` and `binlogtest.items.parquet` —
-  because the converter shards the output by source table. The
-  `"table"` column on each row tells you which file it came from.
-- The five `INSERT`s appear as `EXT_WRITE_ROWS` with `data` = the new
-  row image and `old` / `changed` = NULL.
-- The two `UPDATE`s appear as `EXT_UPDATE_ROWS` with `data` =
-  post-image, `old` = pre-image, and `changed` = a JSON diff
+- One input binlog produced **two** Parquet files. The customers file
+  has 3 rows (2 INSERTs + 1 UPDATE on `customers`); the items file
+  has 5 rows (3 INSERTs + 1 UPDATE + 1 DELETE on `items`). Neither
+  file contains a single row from the other table.
+- The `INSERT`s appear as `EXT_WRITE_ROWS` with `data` = the new row
+  image and `old` / `changed` = NULL.
+- The `UPDATE`s appear as `EXT_UPDATE_ROWS` with `data` = post-image,
+  `old` = pre-image, and `changed` = a JSON diff
   (`{"qty":{"old":10,"new":11}}` /
   `{"email":{"old":"alice@example.com","new":"alice+new@example.com"}}`)
   — exactly what you'd want to power a time-travel query.
 - The `DELETE` appears as `EXT_DELETE_ROWS` with `old` = the row that
   disappeared.
+
+If you do want to query across tables — e.g. to see the full
+chronological event stream — point `read_parquet` at the directory
+glob and the per-row `"table"` column tells you which file each row
+came from:
+
+```bash
+duckdb -c "
+  SELECT timestamp_string, event, \"table\"
+  FROM read_parquet('/tmp/binlog2parquet/01-basic-crud/*.parquet')
+  ORDER BY position;
+"
+```
 
 That's the whole pipeline: **`binlog file → make run → Parquet → DuckDB`**.
 
