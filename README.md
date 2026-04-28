@@ -10,6 +10,25 @@ It is built on top of
 
 ---
 
+## Contents
+
+- [Quickstart](#quickstart--convert-a-sample-binlog-and-query-it-with-duckdb) — convert a sample binlog and query it with DuckDB
+- [Requirements on the source MySQL server](#requirements-on-the-source-mysql-server) — the binlog format / row-image / GTID settings the source must run with
+- [Motivation](#motivation) — what this is for and why it's split out as a converter
+- [Status](#status) — what's been exercised in production
+- [Tradeoffs and known downsides](#tradeoffs-and-known-downsides) — fat jar, heap sizing, JSON-encoded values, no DDL
+- [Possible extensions](#possible-extensions) — service mode, encryption, allow-lists, input-binlog deletion
+- [Build](#build) — Maven build, JDK setup, Docker alternative
+- [Usage](#usage) — CLI flags and output filename layout
+- [Query fingerprinting (optional)](#query-fingerprinting-optional) — `--digest-mysql=...` and what `query_hash` / `query_fingerprint` give you
+- [Output Parquet schema](#output-parquet-schema) — column list, per-event semantics, caveats
+- [Deployment](#deployment) — fat-jar vs. Docker, S3 mounts, archiver-side helper
+- [Memory monitoring](#memory-monitoring) — sizing `-Xmx` for wide-table workloads
+- [Test data](#test-data) — `test/scenarios/` and `make seed-tests`
+- [License](#license)
+
+---
+
 ## Quickstart — convert a sample binlog and query it with DuckDB
 
 The repo ships with a few pre-generated MySQL 8 binlog samples in
@@ -182,6 +201,35 @@ back to one file.
 
 If you don't have a JDK on the host, swap step 1 for the [Docker
 build](#docker-zero-host-install) — same output, no host install.
+
+---
+
+## Requirements on the source MySQL server
+
+The Parquet output captures the full pre/post image of every row, with
+column names. That requires the source MySQL server to be configured so the
+binlog contains enough information to reconstruct it. **The following
+settings are mandatory** — if any of them is missing, the input binlog will
+either fail to parse or will parse with empty/placeholder column data:
+
+| Setting                            | Required value | Why                                                  |
+| ---------------------------------- | -------------- | ---------------------------------------------------- |
+| `binlog_format`                    | `ROW`          | Statement-based binlogs cannot be replayed faithfully |
+| `binlog_row_image`                 | `FULL`         | Both pre- and post-images of every changed row       |
+| `binlog_row_metadata`              | `FULL`         | Embeds column names, signedness, charsets            |
+| `binlog_rows_query_log_events`     | `ON`           | Captures the original SQL alongside each row event    |
+| `gtid_mode`                        | `ON`           | GTID merging in the Parquet output requires GTIDs    |
+| `enforce_gtid_consistency`         | `ON`           | Required for GTID-mode                               |
+
+> **⚠️ Memory note.** `binlog_row_metadata=FULL` is the right setting, but it
+> can dramatically inflate per-event metadata, especially on wide tables.
+> A binlog whose on-disk size is a few hundred MB can easily require several
+> GB of JVM heap to parse, because every row event carries a full copy of
+> the table's column metadata. **Plan to size `-Xmx` generously (4–8 GB is a
+> reasonable starting point for production workloads).** The tool ships
+> with an integrated [`MemoryMonitor`](src/main/java/io/github/binlog2parquet/MemoryMonitor.java)
+> that emits periodic heap-usage reports to stderr so you can tune the heap;
+> see [Memory monitoring](#memory-monitoring).
 
 ---
 
@@ -394,6 +442,21 @@ consequences of the "JVM + Apache Parquet" implementation choice:
   arrive as `QUERY` events and are dropped on the floor. If you need a
   record of schema changes, capture them out-of-band.
 
+- **`binlog_row_metadata=FULL` is mandatory, not just recommended.**
+  The tool does **not** maintain its own schema-evolution state — it
+  doesn't read `ALTER TABLE` events and apply them to a running view
+  of each table's column list. Instead it relies entirely on the
+  per-event metadata MySQL embeds when `binlog_row_metadata=FULL` is
+  set, which carries the column names, types, signedness, and
+  charsets of each row image inline. With the cheaper default
+  (`binlog_row_metadata=MINIMAL`), row events do not contain column
+  names at all, and the converter has no way to recover them — so
+  the output Parquet would have unnamed / placeholder columns. The
+  cost is the heap-amplification described above; the upside is that
+  the converter has zero schema-tracking state and can be restarted,
+  parallelized per binlog file, or replayed out of order without
+  ever getting "stuck" on a missed `ALTER`.
+
 ---
 
 ## Possible extensions
@@ -459,35 +522,6 @@ touch.
 These are deliberately scoped as extensions, not roadmap items — the
 core tool is meant to stay small enough to read end-to-end. If you
 implement any of them, the seams above are where to cut.
-
----
-
-## Requirements on the source MySQL server
-
-The Parquet output captures the full pre/post image of every row, with
-column names. That requires the source MySQL server to be configured so the
-binlog contains enough information to reconstruct it. **The following
-settings are mandatory** — if any of them is missing, the input binlog will
-either fail to parse or will parse with empty/placeholder column data:
-
-| Setting                            | Required value | Why                                                  |
-| ---------------------------------- | -------------- | ---------------------------------------------------- |
-| `binlog_format`                    | `ROW`          | Statement-based binlogs cannot be replayed faithfully |
-| `binlog_row_image`                 | `FULL`         | Both pre- and post-images of every changed row       |
-| `binlog_row_metadata`              | `FULL`         | Embeds column names, signedness, charsets            |
-| `binlog_rows_query_log_events`     | `ON`           | Captures the original SQL alongside each row event    |
-| `gtid_mode`                        | `ON`           | GTID merging in the Parquet output requires GTIDs    |
-| `enforce_gtid_consistency`         | `ON`           | Required for GTID-mode                               |
-
-> **⚠️ Memory note.** `binlog_row_metadata=FULL` is the right setting, but it
-> can dramatically inflate per-event metadata, especially on wide tables.
-> A binlog whose on-disk size is a few hundred MB can easily require several
-> GB of JVM heap to parse, because every row event carries a full copy of
-> the table's column metadata. **Plan to size `-Xmx` generously (4–8 GB is a
-> reasonable starting point for production workloads).** The tool ships
-> with an integrated [`MemoryMonitor`](src/main/java/io/github/binlog2parquet/MemoryMonitor.java)
-> that emits periodic heap-usage reports to stderr so you can tune the heap;
-> see [Memory monitoring](#memory-monitoring).
 
 ---
 
