@@ -93,15 +93,6 @@ Notice that:
 
 That's the whole pipeline: **`binlog file → make run → Parquet → DuckDB`**.
 
-### Why DuckDB?
-
-DuckDB is the lightest-weight way we know to *process* the parquet files
-this tool emits. It has no server, no daemon, no schema registry, no
-external dependencies — just a single binary that reads Parquet
-natively, executes ordinary SQL, joins across files, and pushes filters
-into the Parquet column readers. For everything in this README that
-involves "look at the converted output," DuckDB is what we use.
-
 The same Parquet files work equally well in Spark, Trino, ClickHouse,
 Snowflake (`COPY INTO`), Athena, or Polars — see
 [Output Parquet schema](#output-parquet-schema) for the column list and
