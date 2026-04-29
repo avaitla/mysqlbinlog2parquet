@@ -370,6 +370,45 @@ That has knock-on benefits beyond "it's simpler":
   `aws s3 cp` for inspection. None of that has to be re-implemented or
   re-configured inside the converter.
 
+### 5. Each row change is paired with the SQL that produced it
+
+Mainstream CDC pipelines — Debezium, Fivetran, AWS DMS — give you
+the row diff (post-image, plus pre-image with the right config),
+but they discard the *statement* that produced it. The SQL text
+isn't part of the change record they emit; at best it survives as
+an upstream annotation that never reaches the downstream consumer.
+`binlog2parquet` keeps it: every row event in the output Parquet
+carries the exact SQL text from the corresponding `ROWS_QUERY`
+event in the `query` column (and, when `--digest-mysql=...` is
+supplied, a normalized shape and stable hash in `query_fingerprint`
+/ `query_hash` — see [Query fingerprinting](#query-fingerprinting-optional)).
+
+That makes a class of analyses tractable that are awkward or
+impossible with row-only CDC:
+
+- **Attribute every row change to the statement that issued it.**
+  Joining row diffs back to "which code path / ORM call / ad-hoc
+  human query did this" is one `GROUP BY query_hash` instead of a
+  manual reconciliation against application logs that may not even
+  exist.
+- **Forensics on a specific bad row.** When a value goes wrong, you
+  have not just "what did this column hold last week" but "what
+  statement set it, what other rows the same statement touched, and
+  which transaction (GTID) was it part of."
+- **Schema review of new query shapes.** Combined with the
+  hottest-tables / new-query-shape analyses
+  ([§ 2 above](#2-spot-new-query-shapes-and-find-your-hottest-tables)),
+  this lets you go from "this table is suddenly hot" to "and here
+  is the literal SQL doing it" without instrumenting the
+  application.
+
+The tradeoff is intentional: row-only CDC formats are leaner over
+the wire and easier to feed into a schema-on-read warehouse;
+preserving the SQL means each Parquet row is wider and may carry
+literal values you treat as sensitive. For the audit / observability
+use cases in §1 and §2 the SQL is the most valuable column in the
+file.
+
 ---
 
 ## Status
@@ -456,6 +495,44 @@ consequences of the "JVM + Apache Parquet" implementation choice:
   the converter has zero schema-tracking state and can be restarted,
   parallelized per binlog file, or replayed out of order without
   ever getting "stuck" on a missed `ALTER`.
+
+- **No initial-snapshot / bootstrap mode.** The tool only sees what
+  is in the binlog. Rows that already existed in a table *before*
+  binlogging started — or before the earliest binlog file you have
+  retained — are not represented in any event, and therefore never
+  appear in the Parquet output. CDC stacks that need a "full state
+  at time T" view (e.g. for the first load into a target store)
+  handle this with a separate snapshot phase: `mysqldump` /
+  `SELECT … INTO OUTFILE` / Debezium's snapshot mode / Fivetran's
+  initial sync. `binlog2parquet` has no equivalent; if you need a
+  bootstrap, run it out-of-band and union the result with the
+  converted Parquet downstream. The standard MySQL recipe is:
+    1. Capture the current GTID position
+       (`SELECT @@GLOBAL.GTID_EXECUTED;` or `SHOW MASTER STATUS;`).
+    2. Run `mysqldump --single-transaction --master-data=2 …`
+       against the source. `--single-transaction` opens a
+       `REPEATABLE READ` snapshot so the dump is consistent without
+       blocking writers; `--master-data=2` records the exact
+       binlog coordinate the dump corresponds to as a comment.
+    3. Begin processing binlog files starting **after** the GTID
+       captured in step 1. Every row you load downstream is then
+       either in the dump (initial state) or in a Parquet file from
+       step 3 (subsequent change), with no gap and no double-count.
+
+- **No real-time / tail-following mode — latency is bounded by
+  binlog rotation.** The converter consumes *closed* binlog files
+  only (this is exactly the constraint that lets the archive half
+  stay trivial — see
+  [Decouple archiving from processing](#3-decouple-archiving-from-processing)).
+  A row's earliest possible arrival in Parquet is therefore
+  "whenever the source server next rotates / `FLUSH BINARY LOGS`,
+  plus the time it takes to copy and convert the closed file."
+  Production deployments cap this by sizing `max_binlog_size` and/or
+  running a periodic `FLUSH BINARY LOGS` (e.g. every 5 minutes), so
+  end-to-end latency ends up on the order of "rotation interval +
+  conversion time." If you need second-level CDC latency, this is
+  the wrong tool — reach for Debezium / Maxwell / a tailing replica
+  instead.
 
 ---
 
