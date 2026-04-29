@@ -8,6 +8,8 @@ It is built on top of
 [`mysql-binlog-connector-java`](https://github.com/osheroff/mysql-binlog-connector-java)
 (consumed as a regular Maven dependency) plus Apache Parquet.
 
+This runs in production with High Traffic systems and works well with google big lake on S3 and clickhouse clickpipes S3 ingest.
+
 ---
 
 ## Contents
