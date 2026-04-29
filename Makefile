@@ -1,4 +1,4 @@
-.PHONY: help build run seed-tests clean
+.PHONY: help build run tui seed-tests clean
 
 JAR := target/binlog2parquet-0.1.0-all.jar
 INPUT ?=
@@ -12,6 +12,11 @@ help:
 	@echo "  run         Convert one binlog -> Parquet."
 	@echo "                Required: INPUT=<binlog> OUTPUT=<file-or-dir>"
 	@echo "                Optional: JAVA_OPTS=-Xmx8g  DIGEST_MYSQL=<jdbc-url>"
+	@echo "  tui         Interactive launcher: prompts for input binlog, output"
+	@echo "                shape (single Parquet vs. one-file-per-table directory),"
+	@echo "                and output path, then runs the converter."
+	@echo "                Single-file mode requires duckdb on PATH (uses it to"
+	@echo "                merge the per-table Parquets after conversion)."
 	@echo "  seed-tests  Regenerate test/samples/ via test/generate-binlogs.sh"
 	@echo "                (boots a throwaway MySQL 8 container and replays scenarios)."
 	@echo "  clean       Remove target/."
@@ -31,6 +36,9 @@ run: $(JAR)
 	java $(JAVA_OPTS) -jar $(JAR) \
 	    $(if $(DIGEST_MYSQL),--digest-mysql="$(DIGEST_MYSQL)",) \
 	    "$(INPUT)" "$(OUTPUT)"
+
+tui: $(JAR)
+	@JAVA_OPTS="$(JAVA_OPTS)" ./bin/tui.sh
 
 seed-tests:
 	./test/generate-binlogs.sh

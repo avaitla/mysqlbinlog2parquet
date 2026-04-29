@@ -197,10 +197,30 @@ file ends up substantially larger.
 If you'd rather emit a single combined file anyway, the project is
 designed to be modified: `ParquetExporter.export` is one short method,
 and removing the `groupEventsByTable(...)` call collapses everything
-back to one file.
+back to one file. The `make tui` interactive launcher (described
+below) also offers a single-file mode without code changes — it
+runs the converter into a temp staging directory and merges the
+per-table outputs into one Parquet via DuckDB.
 
 If you don't have a JDK on the host, swap step 1 for the [Docker
 build](#docker-zero-host-install) — same output, no host install.
+
+### Interactive launcher (`make tui`)
+
+If you'd rather not pass paths on the command line, the repo ships
+a small interactive launcher:
+
+```bash
+make tui
+```
+
+It walks through three prompts — input binlog file, output shape
+(per-table directory or single Parquet), output path — then invokes
+the converter. The directory mode is the same code path as
+`make run`; the single-file mode runs the converter into a temp
+staging directory and merges the per-table Parquets into one file
+via DuckDB (so single-file mode requires `duckdb` on `PATH`). The
+underlying Java tool is unchanged — the launcher just wraps it.
 
 ---
 
